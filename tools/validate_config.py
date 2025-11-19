@@ -8,7 +8,9 @@ REQUIRED_CONSTANTS = {
     "NUM_HEADS": "int",
     "NUM_SEGMENTS": "int",
     "SEGMENT_PAYLOAD_SIZE": "int",
+    "TOTAL_GENOME_WEIGHTS": "int",
     "BEHAVIOR_DIM": "int",
+    "BEHAVIORAL_DIMS": "int",
     "BLOCK_SIZE_1D": "int",
     "BLOCK_SIZE_2D": "int",
     "WARP_SIZE": "int",
@@ -17,6 +19,11 @@ REQUIRED_CONSTANTS = {
     "MAX_PATTERNS": "int",
     "MAX_WRITE_EVENTS": "int",
     "MAX_TIMESTEPS": "int",
+    "NUM_STIGMERGY_LAYERS": "int",
+    "NUM_VARIANTS": "int",
+    "WMMA_M": "int",
+    "WMMA_N": "int",
+    "WMMA_K": "int",
 }
 
 REQUIRED_RELATIONSHIPS = [
@@ -24,18 +31,28 @@ REQUIRED_RELATIONSHIPS = [
     ("GRID_SIZE % BLOCK_SIZE_2D == 0", "GRID_SIZE must be divisible by BLOCK_SIZE_2D"),
     ("SEGMENT_PAYLOAD_SIZE >= 64", "SEGMENT_PAYLOAD_SIZE minimum is 64"),
     ("BEHAVIOR_DIM >= 2", "BEHAVIOR_DIM minimum is 2"),
+    ("TOTAL_GENOME_WEIGHTS == NUM_SEGMENTS * SEGMENT_PAYLOAD_SIZE", "TOTAL_GENOME_WEIGHTS consistency"),
+    ("BEHAVIOR_DIM == BEHAVIORAL_DIMS", "BEHAVIOR_DIM aliases must match"),
+    ("WMMA_M == 16 and WMMA_N == 16 and WMMA_K == 16", "WMMA dimensions must be 16x16x16"),
+    ("BLOCK_SIZE_1D % WARP_SIZE == 0", "BLOCK_SIZE_1D must be multiple of WARP_SIZE"),
+    ("NUM_STIGMERGY_LAYERS == 4", "NUM_STIGMERGY_LAYERS must be 4"),
+    ("NUM_VARIANTS == 3", "NUM_VARIANTS must be 3"),
 ]
 
 def parse_constants(file_path):
     constants = {}
     with open(file_path, 'r') as f:
         for line in f:
-            match = re.search(r'constexpr\s+(\w+)\s+(\w+)\s*=\s*([^;]+);', line)
+            match = re.search(r'constexpr\s+(\w+)\s+(\w+)\s*=\s*([^;/]+)', line)
             if match:
                 type_name, const_name, value = match.groups()
+                value = value.strip()
                 try:
                     if 'float' in type_name or '.' in value or 'f' in value:
                         constants[const_name] = float(value.rstrip('f'))
+                    elif '*' in value or '+' in value or '-' in value:
+                        result = eval(value, {}, constants)
+                        constants[const_name] = result
                     else:
                         constants[const_name] = int(value)
                 except:

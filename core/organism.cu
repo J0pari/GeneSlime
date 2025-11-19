@@ -4,6 +4,7 @@
 #include "genome_mutations.cu"
 #include "genome_variants.cu"
 #include "flow_lenia.cu"
+#include "ca_multihead.cu"
 #include "../kernels/tensor_wmma.cu"
 #include "../memory/stigmergy.cu"
 #include "../memory/trace_encoding.cu"

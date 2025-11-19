@@ -3,6 +3,8 @@
 #include "../kernels/utils.cu"
 #include "../kernels/svd_jacobi.cu"
 #include "../utils/tile_ops.cuh"
+#include "../compression/genome_compression.cu"
+#include "parallel_compaction.cu"
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
@@ -11,12 +13,17 @@
 // Behavioral embedding via DIRESA (differential reservoir sampling)
 
 struct CompressedGenome {
-    float* U_matrix;           // Left singular vectors (NUM_SEGMENTS × RANK)
-    float* singular_values;    // Diagonal (RANK)
-    float* Vt_matrix;          // Right singular vectors (RANK × SEGMENT_PAYLOAD_SIZE)
-    int rank;                  // Effective rank
-    uint64_t hash;             // Full genome hash for deduplication
-    uint8_t permission_fingerprint[NUM_SEGMENTS];  // Quick permission check
+    float* U_matrix;
+    float* singular_values;
+    float* Vt_matrix;
+    int rank;
+    uint64_t hash;
+    uint8_t permission_fingerprint[NUM_SEGMENTS];
+    bool is_reference;
+    int reference_cell_idx;
+    uint16_t* delta_indices;
+    float* delta_values;
+    uint16_t num_deltas;
 };
 
 struct VoronoiCell {
@@ -27,6 +34,14 @@ struct VoronoiCell {
     uint32_t occupation_count;
     uint32_t last_update_generation;
     bool occupied;
+    bool is_reference_cell;
+};
+
+struct DIRESAWeights {
+    float* encoder;
+    float* decoder;
+    int current_dim;
+    float reconstruction_error;
 };
 
 struct Archive {
@@ -36,69 +51,46 @@ struct Archive {
     float* behavioral_bounds_max;  // [BEHAVIOR_DIM]
     uint32_t total_insertions;
     uint32_t successful_insertions;
+    DIRESAWeights* diresa_weights;
 };
 
-// DIRESA: Differential reservoir sampling for behavioral embedding
-// Extracts low-dimensional behavioral coordinates from high-dimensional CA states
 __global__ void compute_behavioral_coordinates_kernel(
-    const float* ca_final_state,        // [GRID_SIZE × GRID_SIZE × CHANNELS]
-    const float* stigmergic_trace,      // [GRID_SIZE × GRID_SIZE × NUM_STIGMERGY_LAYERS]
-    const float* flow_magnitude_trace,  // [GRID_SIZE × GRID_SIZE]
-    float* behavioral_coords,           // [BEHAVIOR_DIM]
-    curandState* rand_states,
+    const float* ca_final_state,
+    const float* stigmergic_trace,
+    const float* flow_magnitude_trace,
+    float* behavioral_coords,
+    DIRESAWeights* diresa_weights,
     int organism_id
 ) {
     using GridStride = GridStride1D;
 
-    // Reservoir sampling with differential weighting
-    __shared__ float reservoir[BEHAVIOR_DIM];
-    __shared__ float weights[BEHAVIOR_DIM];
+    __shared__ float hardware_features[TOTAL_GENOME_WEIGHTS];
 
     int tid = threadIdx.x;
-    if (tid < BEHAVIOR_DIM) {
-        reservoir[tid] = 0.0f;
-        weights[tid] = 0.0f;
-    }
-    __syncthreads();
 
-    curandState local_state = rand_states[organism_id * blockDim.x + threadIdx.x];
+    for (int idx = GridStride::start(); idx < GRID_SIZE * GRID_SIZE * CHANNELS; idx += GridStride::stride()) {
+        if (idx < TOTAL_GENOME_WEIGHTS) {
+            int spatial_idx = idx / CHANNELS;
+            int channel = idx % CHANNELS;
+            int y = spatial_idx / GRID_SIZE;
+            int x = spatial_idx % GRID_SIZE;
+            int cell_idx = y * GRID_SIZE + x;
 
-    // Sample spatial features with gradient-based weighting
-    for (int idx = GridStride::start(); idx < GRID_SIZE * GRID_SIZE; idx += GridStride::stride()) {
-        int y = idx / GRID_SIZE;
-        int x = idx % GRID_SIZE;
-        int cell_idx = y * GRID_SIZE + x;
-
-        // Compute local gradient magnitude (importance weight)
-        float grad_mag = flow_magnitude_trace[cell_idx];
-        float stigmergy_activity = 0.0f;
-
-        #pragma unroll
-        for (int layer = 0; layer < NUM_STIGMERGY_LAYERS; layer++) {
-            stigmergy_activity += stigmergic_trace[cell_idx * NUM_STIGMERGY_LAYERS + layer];
-        }
-
-        float importance = grad_mag + 0.1f * stigmergy_activity;
-
-        // Reservoir update with probability proportional to importance
-        for (int b = 0; b < BEHAVIOR_DIM; b++) {
-            float threshold = importance / (weights[b] + importance + 1e-8f);
-            if (curand_uniform(&local_state) < threshold) {
-                int channel = (b * CHANNELS) / BEHAVIOR_DIM;
-                atomicExch(&reservoir[b], ca_final_state[cell_idx * CHANNELS + channel]);
-                atomicAdd(&weights[b], importance);
+            float flow_mag = flow_magnitude_trace[cell_idx];
+            float stigmergy = 0.0f;
+            for (int layer = 0; layer < NUM_STIGMERGY_LAYERS; layer++) {
+                stigmergy += stigmergic_trace[cell_idx * NUM_STIGMERGY_LAYERS + layer];
             }
+
+            hardware_features[idx] = ca_final_state[cell_idx * CHANNELS + channel] *
+                                      (1.0f + 0.1f * flow_mag + 0.05f * stigmergy);
         }
     }
-
     __syncthreads();
 
-    // Write normalized coordinates
-    if (tid < BEHAVIOR_DIM) {
-        behavioral_coords[tid] = reservoir[tid];
+    if (tid == 0) {
+        diresa_encode(hardware_features, behavioral_coords, diresa_weights);
     }
-
-    rand_states[organism_id * blockDim.x + threadIdx.x] = local_state;
 }
 
 // Compute nearest Voronoi cell in behavioral space
@@ -250,14 +242,69 @@ __global__ void archive_insertion_kernel(
     }
 
     if (should_insert) {
-        // Compress and store genome
-        compress_genome_kernel<<<1, NUM_SEGMENTS * SEGMENT_PAYLOAD_SIZE,
-            (NUM_SEGMENTS * NUM_SEGMENTS + NUM_SEGMENTS + NUM_SEGMENTS * SEGMENT_PAYLOAD_SIZE) * sizeof(float)>>>(
-            candidate_genome,
-            &cell->elite_genome,
-            0.95f  // Preserve 95% of variance
-        );
-        cudaDeviceSynchronize();
+        int nearest_reference = -1;
+        float min_behavior_dist = FLT_MAX;
+
+        for (int i = 0; i < archive->num_cells; i++) {
+            if (archive->cells[i].occupied && archive->cells[i].is_reference_cell) {
+                float dist = behavioral_distance_sq(candidate_behavior, archive->cells[i].elite_behavior);
+                if (dist < min_behavior_dist) {
+                    min_behavior_dist = dist;
+                    nearest_reference = i;
+                }
+            }
+        }
+
+        if (nearest_reference >= 0 && min_behavior_dist < 0.1f) {
+            Genome reference_genome;
+            decompress_genome_kernel<<<1, NUM_SEGMENTS>>>(
+                &archive->cells[nearest_reference].elite_genome,
+                &reference_genome
+            );
+            cudaDeviceSynchronize();
+
+            cell->elite_genome.is_reference = false;
+            cell->elite_genome.reference_cell_idx = nearest_reference;
+
+            cudaMalloc(&cell->elite_genome.delta_indices, TOTAL_GENOME_WEIGHTS * sizeof(uint16_t));
+            cudaMalloc(&cell->elite_genome.delta_values, TOTAL_GENOME_WEIGHTS * sizeof(float));
+
+            uint16_t* d_delta_count;
+            cudaMalloc(&d_delta_count, sizeof(uint16_t));
+            cudaMemset(d_delta_count, 0, sizeof(uint16_t));
+
+            int threads = BLOCK_SIZE_1D;
+            int blocks = (TOTAL_GENOME_WEIGHTS + threads - 1) / threads;
+
+            warp_compact_deltas_kernel<<<blocks, threads>>>(
+                const_cast<Genome*>(candidate_genome),
+                &reference_genome,
+                cell->elite_genome.delta_indices,
+                cell->elite_genome.delta_values,
+                d_delta_count
+            );
+            cudaDeviceSynchronize();
+
+            uint16_t num_deltas;
+            cudaMemcpy(&num_deltas, d_delta_count, sizeof(uint16_t), cudaMemcpyDeviceToHost);
+            cell->elite_genome.num_deltas = num_deltas;
+
+            cudaFree(d_delta_count);
+
+            cell->is_reference_cell = false;
+        } else {
+            compress_genome_kernel<<<1, NUM_SEGMENTS * SEGMENT_PAYLOAD_SIZE,
+                (NUM_SEGMENTS * NUM_SEGMENTS + NUM_SEGMENTS + NUM_SEGMENTS * SEGMENT_PAYLOAD_SIZE) * sizeof(float)>>>(
+                candidate_genome,
+                &cell->elite_genome,
+                0.95f
+            );
+            cudaDeviceSynchronize();
+
+            cell->elite_genome.is_reference = true;
+            cell->elite_genome.reference_cell_idx = -1;
+            cell->is_reference_cell = true;
+        }
 
         cell->elite_fitness = candidate_fitness;
         for (int d = 0; d < BEHAVIOR_DIM; d++) {
@@ -276,13 +323,36 @@ __global__ void archive_insertion_kernel(
     atomicAdd(&archive->total_insertions, 1);
 }
 
-// Sample elite from archive with fitness-weighted selection
+__device__ void decompress_from_delta_or_svd(
+    const Archive* archive,
+    const CompressedGenome* compressed,
+    Genome* output_genome
+) {
+    if (compressed->is_reference) {
+        decompress_genome_kernel<<<1, NUM_SEGMENTS>>>(compressed, output_genome);
+    } else {
+        Genome reference_genome;
+        const CompressedGenome* ref = &archive->cells[compressed->reference_cell_idx].elite_genome;
+        decompress_genome_kernel<<<1, NUM_SEGMENTS>>>(ref, &reference_genome);
+        cudaDeviceSynchronize();
+
+        int threads = BLOCK_SIZE_1D;
+        int blocks = (NUM_SEGMENTS + threads - 1) / threads;
+        apply_deltas_kernel<<<blocks, threads>>>(
+            &reference_genome,
+            compressed->delta_indices,
+            compressed->delta_values,
+            compressed->num_deltas,
+            output_genome
+        );
+    }
+}
+
 __device__ void sample_elite(
     const Archive* archive,
     Genome* target_genome,
     curandState* rand_state
 ) {
-    // Count occupied cells
     int occupied_count = 0;
     for (int i = 0; i < archive->num_cells; i++) {
         if (archive->cells[i].occupied) {

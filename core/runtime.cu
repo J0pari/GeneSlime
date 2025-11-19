@@ -7,6 +7,8 @@
 #include "../lifecycle/regulatory.cu"
 #include "../kernels/utils.cu"
 #include "../kernels/archive_batch.cu"
+#include "../learning/diresa.cu"
+#include "../learning/diresa_training.cu"
 #include <cuda_runtime.h>
 #include <stdio.h>
 
@@ -65,6 +67,17 @@ void runtime_allocate(Runtime* runtime, int population_size, int num_generations
     h_archive.total_insertions = 0;
     h_archive.successful_insertions = 0;
 
+    CHECK_CUDA(cudaMalloc(&h_archive.diresa_weights, sizeof(DIRESAWeights)));
+    VALIDATE_DEVICE_PTR(h_archive.diresa_weights);
+
+    DIRESAWeights h_diresa;
+    CHECK_CUDA(cudaMalloc(&h_diresa.encoder, TOTAL_GENOME_WEIGHTS * BEHAVIOR_DIM * sizeof(float)));
+    CHECK_CUDA(cudaMalloc(&h_diresa.decoder, BEHAVIOR_DIM * TOTAL_GENOME_WEIGHTS * sizeof(float)));
+    h_diresa.current_dim = BEHAVIOR_DIM;
+    h_diresa.reconstruction_error = 0.0f;
+
+    cudaMemcpy(h_archive.diresa_weights, &h_diresa, sizeof(DIRESAWeights), cudaMemcpyHostToDevice);
+
     // Set behavioral space bounds
     float h_bounds_min[BEHAVIOR_DIM];
     float h_bounds_max[BEHAVIOR_DIM];
@@ -121,6 +134,11 @@ void runtime_allocate(Runtime* runtime, int population_size, int num_generations
         runtime->d_rand_states,
         10  // CVT iterations
     );
+    cudaDeviceSynchronize();
+
+    DIRESAWeights* d_diresa_ptr = h_diresa.encoder;
+    cudaMemcpy(&d_diresa_ptr, &h_archive.diresa_weights, sizeof(DIRESAWeights*), cudaMemcpyDeviceToHost);
+    init_diresa_kernel<<<32, 256>>>(d_diresa_ptr, 42);
     cudaDeviceSynchronize();
 
     // Initialize regulatory state
@@ -217,9 +235,20 @@ void runtime_step_generation(Runtime* runtime) {
     );
     cudaDeviceSynchronize();
 
+    if (runtime->current_generation % 10 == 0) {
+        train_diresa_step(
+            runtime->d_archive,
+            runtime->d_population,
+            runtime->population_size,
+            runtime->d_rand_states,
+            0.001f,
+            0.5f
+        );
+    }
+
     // Reproduce to create next generation
-    int threads = 256;
-    int blocks = (runtime->population_size + threads - 1) / threads;
+    threads = 256;
+    blocks = (runtime->population_size + threads - 1) / threads;
 
     reproduce_population_kernel<<<blocks, threads>>>(
         runtime->d_population,
