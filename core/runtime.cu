@@ -1,4 +1,5 @@
 #include "../config/constants.cuh"
+#include "../debug/auto_trace.cuh"
 #include "types.cuh"
 #include "organism.cu"
 #include "../memory/archive.cu"
@@ -40,25 +41,25 @@ void runtime_allocate(Runtime* runtime, int population_size, int num_generations
     runtime->dt = 0.1f;
     runtime->current_generation = 0;
 
-    cudaMalloc(&runtime->d_population, population_size * sizeof(Organism));
+    CHECK_CUDA(cudaMalloc(&runtime->d_population, population_size * sizeof(Organism)));
     VALIDATE_DEVICE_PTR(runtime->d_population);
 
-    cudaMalloc(&runtime->d_next_generation, population_size * sizeof(Organism));
+    CHECK_CUDA(cudaMalloc(&runtime->d_next_generation, population_size * sizeof(Organism)));
     VALIDATE_DEVICE_PTR(runtime->d_next_generation);
 
-    cudaMalloc(&runtime->d_archive, sizeof(Archive));
+    CHECK_CUDA(cudaMalloc(&runtime->d_archive, sizeof(Archive)));
     VALIDATE_DEVICE_PTR(runtime->d_archive);
 
     Archive h_archive;
     h_archive.num_cells = 100;
 
-    cudaMalloc(&h_archive.cells, h_archive.num_cells * sizeof(VoronoiCell));
+    CHECK_CUDA(cudaMalloc(&h_archive.cells, h_archive.num_cells * sizeof(VoronoiCell)));
     VALIDATE_DEVICE_PTR(h_archive.cells);
 
-    cudaMalloc(&h_archive.behavioral_bounds_min, BEHAVIOR_DIM * sizeof(float));
+    CHECK_CUDA(cudaMalloc(&h_archive.behavioral_bounds_min, BEHAVIOR_DIM * sizeof(float)));
     VALIDATE_DEVICE_PTR(h_archive.behavioral_bounds_min);
 
-    cudaMalloc(&h_archive.behavioral_bounds_max, BEHAVIOR_DIM * sizeof(float));
+    CHECK_CUDA(cudaMalloc(&h_archive.behavioral_bounds_max, BEHAVIOR_DIM * sizeof(float)));
     VALIDATE_DEVICE_PTR(h_archive.behavioral_bounds_max);
 
     h_archive.total_insertions = 0;

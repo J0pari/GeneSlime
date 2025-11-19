@@ -1,33 +1,57 @@
 #ifndef AUTO_TRACE_CUH
 #define AUTO_TRACE_CUH
 
-// Auto-tracing kernel launch system
-// Include this FIRST in any .cu file to automatically trace all kernel launches
+#ifndef DEBUG_LEVEL
+#define DEBUG_LEVEL 1
+#endif
 
-#include "kernel_trace.cu"
+#if DEBUG_LEVEL >= 1
+    #define DEBUG_PRINT(...) printf(__VA_ARGS__)
+#else
+    #define DEBUG_PRINT(...)
+#endif
 
-// Preprocessor hack: redefine kernel launch syntax
-// We intercept kernel<<<grid, block>>>(args...) by preprocessing it
+#if DEBUG_LEVEL >= 2
+    #define DEBUG_VERBOSE(...) printf(__VA_ARGS__)
+#else
+    #define DEBUG_VERBOSE(...)
+#endif
 
-// Helper to convert standard kernel<<<grid,block,shared,stream>>>(args) to traced version
-// This works by creating wrapper functions that the preprocessor can rewrite
+#if DEBUG_LEVEL >= 3
+    #define DEBUG_TRACE(...) printf("[TRACE] " __VA_ARGS__)
+#else
+    #define DEBUG_TRACE(...)
+#endif
 
-#ifdef __CUDACC__
-// In CUDA mode, define automatic tracing wrappers
+#define CHECK_CUDA(call) \
+    do { \
+        cudaError_t err = call; \
+        if (err != cudaSuccess) { \
+            printf("[CUDA ERROR] %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(1); \
+        } \
+    } while(0)
 
-// Note: We can't directly intercept the <<<>>> operator at preprocessor level
-// Instead, we require using a simple macro for all launches:
-// Instead of: kernel<<<grid, block>>>(args...);
-// Use:        LAUNCH(kernel, grid, block, 0, 0, args...);
-// Or simplified: LAUNCH_SIMPLE(kernel, grid, block, args...);
+#define CHECK_LAST() \
+    do { \
+        cudaError_t err = cudaGetLastError(); \
+        if (err != cudaSuccess) { \
+            printf("[CUDA ERROR] %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+            exit(1); \
+        } \
+    } while(0)
 
-// These macros provide full tracing automatically:
-#define LAUNCH(kernel, grid, block, shared, stream, ...) \
-    traced_kernel_launch(kernel, #kernel, __FILE__, __LINE__, grid, block, shared, stream, ##__VA_ARGS__)
+#define SYNC_AND_CHECK() \
+    do { \
+        CHECK_CUDA(cudaDeviceSynchronize()); \
+    } while(0)
 
-#define LAUNCH_SIMPLE(kernel, grid, block, ...) \
-    traced_kernel_launch(kernel, #kernel, __FILE__, __LINE__, grid, block, 0, 0, ##__VA_ARGS__)
+__device__ void debug_assert(bool condition, const char* msg, const char* file, int line) {
+    if (!condition) {
+        printf("[ASSERT FAILED] %s at %s:%d\n", msg, file, line);
+    }
+}
 
-#endif // __CUDACC__
+#define DEVICE_ASSERT(cond, msg) debug_assert(cond, msg, __FILE__, __LINE__)
 
-#endif // AUTO_TRACE_CUH
+#endif
