@@ -226,6 +226,15 @@ __global__ void evaluate_organism_kernel(
         cudaFree(d_singular_values);
 
         organism->fitness = organism->effective_rank * organism->coherence;
+
+        // Compute causal attribution (which segments contributed to fitness)
+        compute_causal_attribution_kernel<<<1, NUM_SEGMENTS>>>(
+            organism,
+            trace->segment_activation_history,
+            trace->fitness_history,
+            history_length
+        );
+        cudaDeviceSynchronize();
     } else {
         organism->fitness = 1.0f;
         organism->effective_rank = 1.0f;
@@ -377,6 +386,15 @@ __global__ void reproduce_population_kernel(
         &next_generation[offspring_id].genome,
         regulatory,
         &rand_states[offspring_id]
+    );
+    cudaDeviceSynchronize();
+
+    // Apply point mutations
+    apply_point_mutations_kernel<<<1, 1>>>(
+        &next_generation[offspring_id].genome,
+        regulatory->mutation_rate,
+        0.1f,  // mutation scale
+        1
     );
     cudaDeviceSynchronize();
 
