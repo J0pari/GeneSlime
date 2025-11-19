@@ -203,16 +203,22 @@ void train_diresa_step(
     cudaMemset(d_recon_loss, 0, sizeof(float));
     cudaMemset(d_triplet_loss, 0, sizeof(float));
 
-    int combined_blocks = (fmaxf(population_size, num_triplets) + threads - 1) / threads;
-    compute_combined_loss_kernel<<<combined_blocks, threads>>>(
+    // Compute reconstruction loss
+    diresa_reconstruction_loss_kernel<<<blocks, threads>>>(
         d_genome_features,
         d_behavioral_coords,
         d_diresa_weights,
-        d_triplet_indices,
-        population_size,
-        num_triplets,
         d_recon_loss,
+        population_size
+    );
+    cudaDeviceSynchronize();
+
+    // Compute triplet loss
+    diresa_triplet_loss_kernel<<<triplet_blocks, threads>>>(
+        d_behavioral_coords,
+        d_triplet_indices,
         d_triplet_loss,
+        num_triplets,
         triplet_margin
     );
     cudaDeviceSynchronize();
