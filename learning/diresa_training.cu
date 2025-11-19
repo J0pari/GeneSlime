@@ -217,23 +217,52 @@ void train_diresa_step(
     );
     cudaDeviceSynchronize();
 
+    // Initialize autodiff tape for gradient computation
+    ADTape* d_tape;
+    cudaMalloc(&d_tape, sizeof(ADTape));
+    init_ad_tape_kernel<<<1, 1>>>(d_tape, 100000);
+    cudaDeviceSynchronize();
+
+    // Compute gradients via autodiff backward pass
     float *d_encoder_grads, *d_decoder_grads;
     cudaMalloc(&d_encoder_grads, TOTAL_GENOME_WEIGHTS * BEHAVIOR_DIM * sizeof(float));
     cudaMalloc(&d_decoder_grads, BEHAVIOR_DIM * TOTAL_GENOME_WEIGHTS * sizeof(float));
-    cudaMemset(d_encoder_grads, 0, TOTAL_GENOME_WEIGHTS * BEHAVIOR_DIM * sizeof(float));
-    cudaMemset(d_decoder_grads, 0, BEHAVIOR_DIM * TOTAL_GENOME_WEIGHTS * sizeof(float));
+
+    // Backward pass from reconstruction loss
+    ad_backward_kernel<<<1, 1>>>(d_tape, 0, 1.0f);
+    cudaDeviceSynchronize();
+
+    // Extract gradients from tape
+    extract_genome_gradients_kernel<<<threads, threads>>>(
+        d_tape,
+        d_encoder_grads,
+        d_decoder_grads,
+        TOTAL_GENOME_WEIGHTS * BEHAVIOR_DIM,
+        BEHAVIOR_DIM * TOTAL_GENOME_WEIGHTS
+    );
+    cudaDeviceSynchronize();
 
     int grad_size = fmaxf(TOTAL_GENOME_WEIGHTS * BEHAVIOR_DIM, BEHAVIOR_DIM * TOTAL_GENOME_WEIGHTS);
     int grad_blocks = (grad_size + threads - 1) / threads;
 
-    diresa_update_weights_kernel<<<grad_blocks, threads>>>(
-        d_diresa_weights,
+    // Update weights with computed gradients
+    apply_gradients_kernel<<<grad_blocks, threads>>>(
+        d_diresa_weights->encoder,
         d_encoder_grads,
+        learning_rate,
+        TOTAL_GENOME_WEIGHTS * BEHAVIOR_DIM
+    );
+    apply_gradients_kernel<<<grad_blocks, threads>>>(
+        d_diresa_weights->decoder,
         d_decoder_grads,
         learning_rate,
-        5.0f
+        BEHAVIOR_DIM * TOTAL_GENOME_WEIGHTS
     );
     cudaDeviceSynchronize();
+
+    // Cleanup tape
+    reset_tape_kernel<<<1, 1>>>(d_tape);
+    cudaFree(d_tape);
 
     cudaFree(d_genome_features);
     cudaFree(d_behavioral_coords);
