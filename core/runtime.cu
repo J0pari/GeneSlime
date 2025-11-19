@@ -32,24 +32,34 @@ struct Runtime {
 
 // Allocate device memory for runtime
 void runtime_allocate(Runtime* runtime, int population_size, int num_generations) {
+    printf("[RUNTIME] Allocating device memory...\n");
+
     runtime->population_size = population_size;
     runtime->num_generations = num_generations;
     runtime->num_timesteps = 100;
     runtime->dt = 0.1f;
     runtime->current_generation = 0;
 
-    // Allocate populations
     cudaMalloc(&runtime->d_population, population_size * sizeof(Organism));
-    cudaMalloc(&runtime->d_next_generation, population_size * sizeof(Organism));
+    VALIDATE_DEVICE_PTR(runtime->d_population);
 
-    // Allocate archive
+    cudaMalloc(&runtime->d_next_generation, population_size * sizeof(Organism));
+    VALIDATE_DEVICE_PTR(runtime->d_next_generation);
+
     cudaMalloc(&runtime->d_archive, sizeof(Archive));
+    VALIDATE_DEVICE_PTR(runtime->d_archive);
+
     Archive h_archive;
-    h_archive.num_cells = 100;  // Voronoi cells
+    h_archive.num_cells = 100;
 
     cudaMalloc(&h_archive.cells, h_archive.num_cells * sizeof(VoronoiCell));
+    VALIDATE_DEVICE_PTR(h_archive.cells);
+
     cudaMalloc(&h_archive.behavioral_bounds_min, BEHAVIOR_DIM * sizeof(float));
+    VALIDATE_DEVICE_PTR(h_archive.behavioral_bounds_min);
+
     cudaMalloc(&h_archive.behavioral_bounds_max, BEHAVIOR_DIM * sizeof(float));
+    VALIDATE_DEVICE_PTR(h_archive.behavioral_bounds_max);
 
     h_archive.total_insertions = 0;
     h_archive.successful_insertions = 0;
