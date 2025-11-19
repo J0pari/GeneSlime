@@ -23,6 +23,13 @@ struct ExecutionTrace {
     // Kernel contributions
     float* kernel_contributions;    // [NUM_HEADS × GRID_SIZE × GRID_SIZE]
 
+    // Temporal correlation tracking
+    float* segment_activation_history;  // [CORRELATION_WINDOW × NUM_SEGMENTS]
+    float* prediction_error_history;    // [CORRELATION_WINDOW]
+    float* fitness_history;             // [CORRELATION_WINDOW]
+    float segment_correlation_matrix[NUM_SEGMENTS * NUM_SEGMENTS];
+    int history_write_idx;
+
     // Behavioral endpoint
     float behavioral_coordinates[BEHAVIOR_DIM];
     float fitness;
@@ -391,6 +398,69 @@ __global__ void compress_trace_kernel(
     }
 }
 
+// Update temporal correlation tracking (called each timestep during evaluation)
+__global__ void update_correlation_tracking_kernel(
+    TraceEncoder* encoder,
+    int organism_id,
+    const float* segment_activations,  // Current segment activation levels [NUM_SEGMENTS]
+    float prediction_error,
+    float fitness
+) {
+    if (!encoder->recording_enabled) return;
+
+    ExecutionTrace* trace = &encoder->traces[organism_id];
+    int write_idx = trace->history_write_idx % CORRELATION_WINDOW;
+
+    // Update histories (circular buffer)
+    if (threadIdx.x < NUM_SEGMENTS) {
+        trace->segment_activation_history[write_idx * NUM_SEGMENTS + threadIdx.x] = segment_activations[threadIdx.x];
+    }
+
+    if (threadIdx.x == 0) {
+        trace->prediction_error_history[write_idx] = prediction_error;
+        trace->fitness_history[write_idx] = fitness;
+        trace->history_write_idx++;
+    }
+}
+
+// Compute segment correlation matrix from activation history
+__global__ void compute_segment_correlation_matrix_kernel(
+    ExecutionTrace* trace,
+    int history_length
+) {
+    int seg_i = blockIdx.x;
+    int seg_j = threadIdx.x;
+
+    if (seg_i >= NUM_SEGMENTS || seg_j >= NUM_SEGMENTS) return;
+
+    // Compute correlation between segment i and segment j across time
+    float mean_i = 0.0f;
+    float mean_j = 0.0f;
+
+    for (int t = 0; t < history_length; t++) {
+        mean_i += trace->segment_activation_history[t * NUM_SEGMENTS + seg_i];
+        mean_j += trace->segment_activation_history[t * NUM_SEGMENTS + seg_j];
+    }
+    mean_i /= history_length;
+    mean_j /= history_length;
+
+    float cov = 0.0f;
+    float var_i = 0.0f;
+    float var_j = 0.0f;
+
+    for (int t = 0; t < history_length; t++) {
+        float dev_i = trace->segment_activation_history[t * NUM_SEGMENTS + seg_i] - mean_i;
+        float dev_j = trace->segment_activation_history[t * NUM_SEGMENTS + seg_j] - mean_j;
+
+        cov += dev_i * dev_j;
+        var_i += dev_i * dev_i;
+        var_j += dev_j * dev_j;
+    }
+
+    float correlation = cov / (sqrtf(var_i * var_j) + 1e-10f);
+    trace->segment_correlation_matrix[seg_i * NUM_SEGMENTS + seg_j] = correlation;
+}
+
 // Clear trace for new evaluation
 __global__ void reset_trace_kernel(
     TraceEncoder* encoder,
@@ -405,6 +475,7 @@ __global__ void reset_trace_kernel(
 
     if (threadIdx.x == 0 && blockIdx.x == 0) {
         trace->write_event_count = 0;
+        trace->history_write_idx = 0;
         encoder->current_timestep = 0;
     }
 }

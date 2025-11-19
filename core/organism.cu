@@ -161,14 +161,79 @@ __global__ void evaluate_organism_kernel(
 
     cudaMemcpy(organism->behavioral_coords, behavioral_coords, BEHAVIOR_DIM * sizeof(float), cudaMemcpyDeviceToDevice);
 
-    // Stage 5: Compute fitness
-    compute_fitness_kernel<<<1, 1>>>(
-        ca_concentration,
-        &organism->genome,
-        stigmergy,
-        &organism->fitness,
-        GRID_SIZE * GRID_SIZE
+    // Stage 5: Compute fitness using correlation tracking
+    ExecutionTrace* trace = &trace_encoder->traces[organism_id];
+
+    // Compute segment activation levels for correlation tracking
+    float* d_segment_activations;
+    cudaMalloc(&d_segment_activations, NUM_SEGMENTS * sizeof(float));
+
+    // Aggregate spatial activations per segment
+    for (int seg = 0; seg < NUM_SEGMENTS; seg++) {
+        float* seg_activation_map = &trace->segment_activations[seg * GRID_SIZE * GRID_SIZE];
+        reduce_sum_kernel<<<1, BLOCK_SIZE_1D>>>(
+            seg_activation_map,
+            &d_segment_activations[seg],
+            GRID_SIZE * GRID_SIZE
+        );
+    }
+
+    // Compute prediction error (variance as proxy)
+    float* d_prediction_error;
+    cudaMalloc(&d_prediction_error, sizeof(float));
+    compute_variance_kernel<<<1, 256>>>(ca_concentration, d_prediction_error, GRID_SIZE * GRID_SIZE * CHANNELS);
+
+    float prediction_error;
+    cudaMemcpy(&prediction_error, d_prediction_error, sizeof(float), cudaMemcpyDeviceToHost);
+
+    // Update correlation tracking
+    update_correlation_tracking_kernel<<<1, NUM_SEGMENTS>>>(
+        trace_encoder,
+        organism_id,
+        d_segment_activations,
+        prediction_error,
+        0.0f
     );
+    cudaDeviceSynchronize();
+
+    // Compute segment correlation matrix
+    int history_length = min(trace->history_write_idx, CORRELATION_WINDOW);
+    if (history_length >= 2) {
+        compute_segment_correlation_matrix_kernel<<<NUM_SEGMENTS, NUM_SEGMENTS>>>(trace, history_length);
+        cudaDeviceSynchronize();
+
+        // Compute coherence
+        float* d_coherence;
+        cudaMalloc(&d_coherence, sizeof(float));
+        compute_coherence_kernel<<<1, BLOCK_SIZE_1D>>>(
+            trace->prediction_error_history,
+            d_coherence,
+            history_length
+        );
+        cudaMemcpy(&organism->coherence, d_coherence, sizeof(float), cudaMemcpyDeviceToHost);
+        cudaFree(d_coherence);
+
+        // Compute effective rank
+        float* d_singular_values;
+        cudaMalloc(&d_singular_values, NUM_SEGMENTS * sizeof(float));
+        compute_effective_rank_kernel<<<1, WARP_SIZE>>>(
+            trace->segment_correlation_matrix,
+            d_singular_values,
+            &organism->effective_rank,
+            NUM_SEGMENTS
+        );
+        cudaDeviceSynchronize();
+        cudaFree(d_singular_values);
+
+        organism->fitness = organism->effective_rank * organism->coherence;
+    } else {
+        organism->fitness = 1.0f;
+        organism->effective_rank = 1.0f;
+        organism->coherence = 1.0f;
+    }
+
+    cudaFree(d_segment_activations);
+    cudaFree(d_prediction_error);
     cudaDeviceSynchronize();
 
     // Store trace endpoint
